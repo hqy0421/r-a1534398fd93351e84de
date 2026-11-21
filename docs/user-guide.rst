@@ -248,6 +248,37 @@ Alternatively, use ``gspread.utils.to_records()`` for more control over headers:
        # {'fruit': 'banana', 'alternate name': 'yellow stick', 'tastiness': 'quite'}
 
 
+Getting a Range With a Multi-Row Merged Header as Structured Records
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Supplier reports often use merged cells over several header rows. Use
+``get_merged_header_records()`` with a bounded range and the number of
+header rows to export structured records directly:
+
+.. code:: python
+
+   # Sheet data:
+   #      A        B       C        D
+   # 1    product  price            quantity
+   # 2             unit    total
+   # 3    apple    3       30       10
+   #
+   # with A1:A2, B1:C1 and D1:D2 merged
+
+   records = worksheet.get_merged_header_records("A1:D3", header_rows=2)
+
+   # one ordered header path per column, built from the merge coordinates
+   records.columns[0].path   # ('product', None)  <- vertical merge recorded once
+   records.columns[1].path   # ('price', 'unit')
+   records.columns[1].labels[0].address  # 'B1'   <- label source cell
+
+   # one record per data row, keyed by the original column address
+   records[0]  # {'A': 'apple', 'B': '3', 'C': '30', 'D': '10'}
+
+A merged range that crosses the boundary between the header rows and the
+data rows raises :class:`~gspread.exceptions.MergedHeaderError`.
+
+
 Getting All Values From Every Worksheet at Once
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

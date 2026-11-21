@@ -19,8 +19,10 @@ from typing import (
     Callable,
     Dict,
     Iterable,
+    Iterator,
     List,
     Mapping,
+    NamedTuple,
     Optional,
     Tuple,
     TypeVar,
@@ -32,7 +34,12 @@ from google.auth.credentials import Credentials as Credentials
 from google.oauth2.credentials import Credentials as UserCredentials
 from google.oauth2.service_account import Credentials as ServiceAccountCredentials
 
-from .exceptions import IncorrectCellLabel, InvalidInputValue, NoValidUrlKeyFound
+from .exceptions import (
+    IncorrectCellLabel,
+    InvalidInputValue,
+    MergedHeaderError,
+    NoValidUrlKeyFound,
+)
 
 if TYPE_CHECKING:
     from .cell import Cell
@@ -850,6 +857,348 @@ def combined_merge_values(
                 new_values[row_index][col_index] = top_left_value
 
     return new_values
+
+
+class HeaderLabel(NamedTuple):
+    """A single label of a column header path, together with the absolute
+    coordinates of the cell it was read from (its "source").
+
+    .. versionadded:: 6.3.0
+    """
+
+    value: Any
+    """The label value, as read from the source cell."""
+
+    address: str
+    """Absolute A1 notation of the source cell, e.g. ``"B2"``."""
+
+    row: int
+    """Absolute row number of the source cell (1-based)."""
+
+    column: int
+    """Absolute column number of the source cell (1-based)."""
+
+    level: int
+    """Header level at which the label starts (1-based: the first header
+    row of the read range is level 1)."""
+
+    level_span: int
+    """Number of header levels the label covers. Greater than 1 when the
+    label comes from a vertical merge spanning several header rows."""
+
+
+class MergedHeaderColumn(NamedTuple):
+    """The header description of a single column of a read range, as built
+    by :func:`merged_header_columns`.
+
+    .. versionadded:: 6.3.0
+    """
+
+    column: str
+    """The column address (A1 letter(s)), e.g. ``"B"``."""
+
+    column_index: int
+    """The absolute column number (1-based)."""
+
+    path: Tuple[Any, ...]
+    """The ordered header path of the column: one entry per header level.
+
+    A label coming from a vertical merge is recorded only once, at the
+    level where its merge starts; the levels it covers below are
+    represented by :const:`None` so every level keeps its position.
+    """
+
+    labels: Tuple[HeaderLabel, ...]
+    """The ordered label sources of the column."""
+
+
+def _column_index_to_letter(index: int) -> str:
+    """Converts a 1-based column index to its A1 letter(s).
+
+    >>> _column_index_to_letter(1)
+    'A'
+    >>> _column_index_to_letter(28)
+    'AB'
+    """
+    return rowcol_to_a1(1, index)[:-1]
+
+
+def _iter_header_merges(
+    merges: Iterable[Mapping[str, int]],
+    start_row_index: int,
+    start_col_index: int,
+    col_count: int,
+    header_rows: int,
+) -> Iterator[Mapping[str, int]]:
+    """Yields the merges (absolute ``GridRange`` dicts, as found in the
+    sheet metadata) that intersect the header zone of a read window.
+
+    The header zone is made of the first ``header_rows`` rows of the window
+    starting at (``start_row_index``, ``start_col_index``) and spanning
+    ``col_count`` columns. All indexes are zero-based, end indexes are
+    exclusive.
+
+    :raises MergedHeaderError: if a merge crosses the boundary between
+        the header rows and the data rows.
+    """
+    header_end = start_row_index + header_rows
+    end_col = start_col_index + col_count
+
+    for merge in merges:
+        merge_start_row = merge["startRowIndex"]
+        merge_end_row = merge["endRowIndex"]
+        merge_start_col = merge["startColumnIndex"]
+        merge_end_col = merge["endColumnIndex"]
+
+        # ignore merges outside the window columns
+        if merge_end_col <= start_col_index or merge_start_col >= end_col:
+            continue
+
+        # ignore merges outside the header rows
+        if merge_end_row <= start_row_index or merge_start_row >= header_end:
+            continue
+
+        if merge_end_row > header_end:
+            merge_a1 = "{}:{}".format(
+                rowcol_to_a1(merge_start_row + 1, merge_start_col + 1),
+                rowcol_to_a1(merge_end_row, merge_end_col),
+            )
+            raise MergedHeaderError(
+                "the merged range {} crosses the boundary between the header "
+                "rows and the data rows (data starts at row {})".format(
+                    merge_a1, header_end + 1
+                )
+            )
+
+        yield merge
+
+
+def out_of_range_merge_anchors(
+    merges: Iterable[Mapping[str, int]],
+    start_row_index: int,
+    start_col_index: int,
+    row_count: int,
+    col_count: int,
+    header_rows: int,
+) -> List[Tuple[int, int]]:
+    """Returns the absolute coordinates of the top-left cells ("anchors") of
+    the merged ranges that intersect the header zone of a read window but
+    whose anchor lies outside the window.
+
+    Those anchors hold the label of the cells they cover, so their value
+    must be fetched separately before calling :func:`merged_header_columns`
+    (otherwise the label of the covered columns would be lost and the
+    following columns could be mistaken for labels).
+
+    All indexes are zero-based, end indexes are exclusive.
+
+    :param merges: the worksheet merges (absolute ``GridRange`` dicts).
+    :param start_row_index: zero-based index of the first row of the window.
+    :param start_col_index: zero-based index of the first column of the window.
+    :param row_count: number of rows of the window.
+    :param col_count: number of columns of the window.
+    :param header_rows: number of top rows of the window used as header.
+
+    :returns: sorted list of ``(row, column)`` tuples, zero-based.
+
+    :raises MergedHeaderError: if a merge crosses the boundary between
+        the header rows and the data rows.
+
+    Example::
+
+        >>> merges = [{"startRowIndex": 0, "endRowIndex": 2,
+        ...            "startColumnIndex": 0, "endColumnIndex": 2}]
+        >>> # window B2:E5 (0-based: row 1, col 1), 1 header row
+        >>> out_of_range_merge_anchors(merges, 1, 1, 4, 4, 1)
+        [(0, 0)]
+    """
+    end_row = start_row_index + row_count
+    end_col = start_col_index + col_count
+
+    anchors = set()
+    for merge in _iter_header_merges(
+        merges, start_row_index, start_col_index, col_count, header_rows
+    ):
+        anchor_row = merge["startRowIndex"]
+        anchor_col = merge["startColumnIndex"]
+        in_window = (
+            start_row_index <= anchor_row < end_row
+            and start_col_index <= anchor_col < end_col
+        )
+        if not in_window:
+            anchors.add((anchor_row, anchor_col))
+
+    return sorted(anchors)
+
+
+def merged_header_columns(
+    values: List[List[Any]],
+    merges: Iterable[Mapping[str, int]],
+    start_row_index: int,
+    start_col_index: int,
+    header_rows: int,
+    anchor_values: Optional[Mapping[Tuple[int, int], Any]] = None,
+) -> List[MergedHeaderColumn]:
+    """Builds the ordered header path and the label sources of every column
+    of a read window, following the absolute coordinates of the merged
+    ranges.
+
+    A label coming from a vertical merge is recorded only once in the
+    column path (the levels it covers below hold :const:`None`, so every
+    level keeps its position). Columns sharing the same path are still
+    returned independently, under their own column address.
+
+    :param values: the values of the window as a rectangular matrix (pad it
+        first, e.g. with :func:`fill_gaps`, so that positions stay aligned).
+    :param merges: the worksheet merges (absolute ``GridRange`` dicts, as
+        returned by the API in the sheet metadata).
+    :param start_row_index: zero-based index of the first row of the window.
+    :param start_col_index: zero-based index of the first column of the window.
+    :param header_rows: number of top rows of the window used as header.
+    :param anchor_values: values of the merge anchors located outside the
+        window, keyed by absolute zero-based ``(row, column)`` tuples, as
+        returned by :func:`out_of_range_merge_anchors`.
+
+    :returns: one :class:`MergedHeaderColumn` per column of the window, in
+        column order.
+
+    :raises MergedHeaderError: if a merge crosses the boundary between
+        the header rows and the data rows.
+
+    Example::
+
+        >>> # window A1:C3, 2 header rows, A1:A2 merged vertically
+        >>> # and B1:C1 merged horizontally
+        >>> values = [["product", "price", ""], ["", "unit", "total"], ["apple", 3, 30]]
+        >>> merges = [
+        ...     {"startRowIndex": 0, "endRowIndex": 2, "startColumnIndex": 0, "endColumnIndex": 1},
+        ...     {"startRowIndex": 0, "endRowIndex": 1, "startColumnIndex": 1, "endColumnIndex": 3},
+        ... ]
+        >>> columns = merged_header_columns(values, merges, 0, 0, 2)
+        >>> columns[0].path
+        ('product', None)
+        >>> columns[1].path
+        ('price', 'unit')
+        >>> columns[1].labels[0]
+        HeaderLabel(value='price', address='B1', row=1, column=2, level=1, level_span=1)
+    """
+    row_count = len(values)
+    col_count = len(values[0]) if row_count > 0 else 0
+
+    if header_rows < 1:
+        raise InvalidInputValue(
+            "header_rows must be at least 1, got: {!r}".format(header_rows)
+        )
+    if header_rows > row_count:
+        raise InvalidInputValue(
+            "header_rows ({}) exceeds the number of rows in the range ({})".format(
+                header_rows, row_count
+            )
+        )
+
+    if anchor_values is None:
+        anchor_values = {}
+
+    end_row = start_row_index + row_count
+    end_col = start_col_index + col_count
+
+    # absolute coordinates of the anchor (the cell holding the label)
+    # of every cell of the header zone
+    cell_anchors: Dict[Tuple[int, int], Tuple[int, int]] = {}
+    for merge in _iter_header_merges(
+        merges, start_row_index, start_col_index, col_count, header_rows
+    ):
+        anchor = (merge["startRowIndex"], merge["startColumnIndex"])
+        # the merge does not cross the header/data boundary (checked by
+        # _iter_header_merges) so it ends within the header rows
+        for row in range(
+            max(merge["startRowIndex"], start_row_index), merge["endRowIndex"]
+        ):
+            for col in range(
+                max(merge["startColumnIndex"], start_col_index),
+                min(merge["endColumnIndex"], end_col),
+            ):
+                cell_anchors[(row, col)] = anchor
+
+    return [
+        _merged_header_column(
+            col,
+            cell_anchors,
+            values,
+            anchor_values,
+            start_row_index,
+            start_col_index,
+            end_row,
+            end_col,
+            header_rows,
+        )
+        for col in range(start_col_index, end_col)
+    ]
+
+
+def _merged_header_column(
+    col: int,
+    cell_anchors: Mapping[Tuple[int, int], Tuple[int, int]],
+    values: List[List[Any]],
+    anchor_values: Mapping[Tuple[int, int], Any],
+    start_row_index: int,
+    start_col_index: int,
+    end_row: int,
+    end_col: int,
+    header_rows: int,
+) -> MergedHeaderColumn:
+    """Builds the header path and label sources of a single column of the
+    read window (``col`` is a zero-based absolute column index)."""
+    path: List[Any] = []
+    labels: List[HeaderLabel] = []
+    level = 0
+    while level < header_rows:
+        row = start_row_index + level
+        anchor_row, anchor_col = cell_anchors.get((row, col), (row, col))
+
+        if (
+            start_row_index <= anchor_row < end_row
+            and start_col_index <= anchor_col < end_col
+        ):
+            value = values[anchor_row - start_row_index][anchor_col - start_col_index]
+        else:
+            try:
+                value = anchor_values[(anchor_row, anchor_col)]
+            except KeyError:
+                raise InvalidInputValue(
+                    "missing value for the anchor {} of a merged range "
+                    "located outside the read window, provide it in "
+                    "anchor_values".format(rowcol_to_a1(anchor_row + 1, anchor_col + 1))
+                )
+
+        # a vertical merge is recorded only once: count the levels it covers
+        level_span = 1
+        while level + level_span < header_rows and cell_anchors.get(
+            (start_row_index + level + level_span, col),
+            (start_row_index + level + level_span, col),
+        ) == (anchor_row, anchor_col):
+            level_span += 1
+
+        labels.append(
+            HeaderLabel(
+                value=value,
+                address=rowcol_to_a1(anchor_row + 1, anchor_col + 1),
+                row=anchor_row + 1,
+                column=anchor_col + 1,
+                level=level + 1,
+                level_span=level_span,
+            )
+        )
+        path.append(value)
+        path.extend([None] * (level_span - 1))
+        level += level_span
+
+    return MergedHeaderColumn(
+        column=_column_index_to_letter(col + 1),
+        column_index=col + 1,
+        path=tuple(path),
+        labels=tuple(labels),
+    )
 
 
 def convert_hex_to_colors_dict(hex_color: str) -> Mapping[str, float]:

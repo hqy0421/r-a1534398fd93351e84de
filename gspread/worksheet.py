@@ -30,7 +30,7 @@ from typing import (
 )
 
 from .cell import Cell
-from .exceptions import GSpreadException
+from .exceptions import GSpreadException, InvalidInputValue
 from .http_client import DefaultSerializerType, HTTPClient, ParamsType
 from .urls import WORKSHEET_DRIVE_URL
 from .utils import (
@@ -38,6 +38,7 @@ from .utils import (
     Dimension,
     GridRangeType,
     InsertDataOption,
+    MergedHeaderColumn,
     MergeType,
     PasteOrientation,
     PasteType,
@@ -59,7 +60,9 @@ from .utils import (
     finditem,
     get_a1_from_absolute_range,
     is_full_a1_notation,
+    merged_header_columns,
     numericise_all,
+    out_of_range_merge_anchors,
     rowcol_to_a1,
     to_records,
 )
@@ -156,6 +159,63 @@ class ValueRange(list):
             return self[0][0]
         except IndexError:
             return default
+
+
+class MergedHeaderRecords(list):
+    """The result of :meth:`~gspread.worksheet.Worksheet.get_merged_header_records`.
+
+    This class inherits the :const:`list` object type and behaves like a
+    list. It holds one record (a :const:`dict`) per data row of the read
+    range, keyed by the original column address (``"A"``, ``"B"``, ...).
+
+    Columns sharing the same header path stay independent: every record
+    holds one value per column of the read range, under that column's own
+    address. The header path and the label sources of each column are
+    available in :meth:`columns`.
+
+    .. note::
+
+       This class should never be instantiated manually.
+       It is returned by
+       :meth:`~gspread.worksheet.Worksheet.get_merged_header_records`.
+
+    .. versionadded:: 6.3.0
+    """
+
+    def __init__(
+        self,
+        records: Iterable[Dict[str, Any]],
+        columns: List[MergedHeaderColumn],
+        range_name: str,
+        header_rows: int,
+        first_data_row: int,
+    ) -> None:
+        super().__init__(records)
+        self._columns = columns
+        self._range_name = range_name
+        self._header_rows = header_rows
+        self._first_data_row = first_data_row
+
+    @property
+    def columns(self) -> List[MergedHeaderColumn]:
+        """The header description of every column of the read range, in
+        column order."""
+        return self._columns
+
+    @property
+    def range(self) -> str:
+        """The A1 range the records were read from."""
+        return self._range_name
+
+    @property
+    def header_rows(self) -> int:
+        """The number of header rows used to build the column paths."""
+        return self._header_rows
+
+    @property
+    def first_data_row(self) -> int:
+        """The absolute row number (1-based) of the first record."""
+        return self._first_data_row
 
 
 class Worksheet:
@@ -611,6 +671,173 @@ class Worksheet:
             ]
 
         return to_records(keys, values)
+
+    def get_merged_header_records(
+        self,
+        range_name: str,
+        header_rows: int = 1,
+        value_render_option: Optional[ValueRenderOption] = None,
+        date_time_render_option: Optional[DateTimeOption] = None,
+        default_blank: Any = "",
+    ) -> MergedHeaderRecords:
+        """Reads a bounded range with a multi-row (possibly merged) header
+        and exports it as structured records.
+
+        The first ``header_rows`` rows of the range make the header. Using
+        the absolute coordinates of the merged ranges, an ordered header
+        path and the label sources are built for every column (see
+        :func:`gspread.utils.merged_header_columns`):
+
+        * a label coming from a vertical merge is recorded only once in the
+          column path, the levels it covers below keep their position as
+          :const:`None`;
+        * columns sharing the same path are still exported independently,
+          under their own column address;
+        * when the top-left cell of a merge lies outside the read range,
+          that cell is fetched with an extra request so the covered columns
+          get the right label instead of mistaking the following columns
+          for labels.
+
+        The data rows are aligned on the original rows and columns: blank
+        cells omitted by the API are padded with ``default_blank`` without
+        shifting the other values, and existing values (including ``0``
+        and ``False``) are kept as-is.
+
+        .. note::
+
+           This method makes 2 API requests (3 when merged ranges start
+           outside the read range). The other read methods are left
+           untouched.
+
+        :param str range_name: the bounded range to read, in A1 notation
+            (e.g. ``"A1:F20"``). Unbounded ranges (``"A:F"``, ``"A1"``)
+            and named ranges are rejected.
+        :param int header_rows: (optional) number of top rows of the range
+            used as header, defaults to 1.
+        :param value_render_option: (optional) Determines how values should
+            be rendered in the output. See `ValueRenderOption`_ in
+            the Sheets API.
+        :type value_render_option: :class:`~gspread.utils.ValueRenderOption`
+        :param str date_time_render_option: (optional) How dates, times, and
+            durations should be represented in the output.
+        :type date_time_render_option: :class:`~gspread.utils.DateTimeOption`
+        :param Any default_blank: (optional) value used to pad the blank
+            cells omitted by the API, defaults to empty string.
+
+        :raises InvalidInputValue: if the range is not a bounded A1 range
+            or ``header_rows`` does not fit in the range.
+        :raises MergedHeaderError: if a merged range crosses the boundary
+            between the header rows and the data rows.
+
+        :rtype: :class:`~gspread.worksheet.MergedHeaderRecords`
+
+        .. versionadded:: 6.3.0
+
+        Examples::
+
+            # Sheet data:
+            #      A        B       C        D
+            # 1    product  price            quantity
+            # 2             unit    total
+            # 3    apple    3       30       10
+            #
+            # with A1:A2, B1:C1 and D1:D2 merged
+
+            >>> records = worksheet.get_merged_header_records("A1:D3", header_rows=2)
+            >>> records.columns[0].path
+            ('product', None)
+            >>> records.columns[1].path
+            ('price', 'unit')
+            >>> records.columns[1].labels[0]
+            HeaderLabel(value='price', address='B1', row=1, column=2, level=1, level_span=1)
+            >>> records[0]
+            {'A': 'apple', 'B': '3', 'C': '30', 'D': '10'}
+        """
+        if not is_full_a1_notation(range_name):
+            raise InvalidInputValue(
+                "range_name must be a bounded range in A1 notation "
+                "(e.g. 'A1:F20'), got: {!r}".format(range_name)
+            )
+
+        grid_range = a1_range_to_grid_range(get_a1_from_absolute_range(range_name))
+        start_row = grid_range["startRowIndex"]
+        start_col = grid_range["startColumnIndex"]
+        row_count = grid_range["endRowIndex"] - start_row
+        col_count = grid_range["endColumnIndex"] - start_col
+
+        if header_rows < 1:
+            raise InvalidInputValue(
+                "header_rows must be at least 1, got: {!r}".format(header_rows)
+            )
+        if header_rows > row_count:
+            raise InvalidInputValue(
+                "header_rows ({}) exceeds the number of rows in the range "
+                "({})".format(header_rows, row_count)
+            )
+
+        params: ParamsType = {
+            "valueRenderOption": value_render_option,
+            "dateTimeRenderOption": date_time_render_option,
+        }
+
+        response = self.client.values_get(
+            self.spreadsheet_id,
+            absolute_range_name(self.title, range_name),
+            params=params,
+        )
+
+        # pad the blanks omitted by the API so values stay aligned on their
+        # original rows and columns; existing values (0, False, ...) are kept
+        values = fill_gaps(
+            response.get("values", []),
+            rows=row_count,
+            cols=col_count,
+            padding_value=default_blank,
+        )
+
+        spreadsheet_meta = self.client.fetch_sheet_metadata(self.spreadsheet_id)
+        worksheet_meta = finditem(
+            lambda x: x["properties"]["sheetId"] == self.id,
+            spreadsheet_meta["sheets"],
+        )
+        merges = worksheet_meta.get("merges", [])
+
+        # labels of merges whose top-left cell lies outside the read range
+        # must be fetched from their true anchor cell
+        anchors = out_of_range_merge_anchors(
+            merges, start_row, start_col, row_count, col_count, header_rows
+        )
+
+        anchor_values: Dict[Tuple[int, int], Any] = {}
+        if anchors:
+            anchor_ranges = [rowcol_to_a1(row + 1, col + 1) for (row, col) in anchors]
+            value_ranges = self.batch_get(
+                anchor_ranges,
+                value_render_option=value_render_option,
+                date_time_render_option=date_time_render_option,
+            )
+            for (row, col), value_range in zip(anchors, value_ranges):
+                anchor_values[(row, col)] = (
+                    value_range[0][0]
+                    if value_range and value_range[0]
+                    else default_blank
+                )
+
+        columns = merged_header_columns(
+            values, merges, start_row, start_col, header_rows, anchor_values
+        )
+
+        records = to_records(
+            [column.column for column in columns], values[header_rows:]
+        )
+
+        return MergedHeaderRecords(
+            records,
+            columns=columns,
+            range_name=range_name,
+            header_rows=header_rows,
+            first_data_row=start_row + header_rows + 1,
+        )
 
     def get_all_cells(self) -> List[Cell]:
         """Returns a list of all `Cell` of the current sheet."""

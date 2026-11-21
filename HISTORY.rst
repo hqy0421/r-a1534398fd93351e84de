@@ -1,6 +1,17 @@
 Release History
 ===============
 
+Unreleased
+----------
+
+* Add ``Worksheet.get_merged_header_records()``: read a bounded A1 range with a
+  multi-row merged header and export structured records. An ordered header path
+  and the label sources are built for every column from the absolute coordinates
+  of the merged ranges; merges whose top-left cell lies outside the read range
+  are fetched from their true anchor cell. A merge crossing the boundary between
+  the header rows and the data rows raises the new
+  ``gspread.exceptions.MergedHeaderError``.
+
 6.2.1 (2025-05-14)
 ------------------
 

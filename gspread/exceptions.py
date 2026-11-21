@@ -31,6 +31,11 @@ class IncorrectCellLabel(GSpreadException):
     """The cell label is incorrect."""
 
 
+class MergedHeaderError(GSpreadException):
+    """A merged cell range is incompatible with the requested header layout,
+    e.g. it crosses the boundary between the header rows and the data rows."""
+
+
 class InvalidInputValue(GSpreadException):
     """The provided values is incorrect."""
 

@@ -690,3 +690,203 @@ class UtilsTest(unittest.TestCase):
         table = utils.find_table(values, "A1", utils.TableDirection.table)
 
         self.assertListEqual(table, [], "resulting table should be empty")
+
+
+class MergedHeaderColumnsTest(unittest.TestCase):
+    """Tests for utils.merged_header_columns and utils.out_of_range_merge_anchors."""
+
+    # window A1:D3 with 2 header rows; merges: A1:A2, B1:C1, D1:D2
+    VALUES = [
+        ["product", "price", "", "quantity"],
+        ["", "unit", "total", ""],
+        ["apple", 3, 30, 10],
+    ]
+    MERGES = [
+        {
+            "startRowIndex": 0,
+            "endRowIndex": 2,
+            "startColumnIndex": 0,
+            "endColumnIndex": 1,
+        },
+        {
+            "startRowIndex": 0,
+            "endRowIndex": 1,
+            "startColumnIndex": 1,
+            "endColumnIndex": 3,
+        },
+        {
+            "startRowIndex": 0,
+            "endRowIndex": 2,
+            "startColumnIndex": 3,
+            "endColumnIndex": 4,
+        },
+    ]
+
+    def test_paths_and_label_sources(self):
+        columns = utils.merged_header_columns(self.VALUES, self.MERGES, 0, 0, 2)
+
+        self.assertEqual([c.column for c in columns], ["A", "B", "C", "D"])
+        self.assertEqual([c.column_index for c in columns], [1, 2, 3, 4])
+
+        # vertical merge: label recorded once, level positions kept
+        self.assertEqual(columns[0].path, ("product", None))
+        self.assertEqual(
+            columns[0].labels,
+            (utils.HeaderLabel("product", "A1", 1, 1, 1, 2),),
+        )
+
+        # horizontal merge: each column gets the label, source is the anchor B1
+        self.assertEqual(columns[1].path, ("price", "unit"))
+        self.assertEqual(
+            columns[1].labels,
+            (
+                utils.HeaderLabel("price", "B1", 1, 2, 1, 1),
+                utils.HeaderLabel("unit", "B2", 2, 2, 2, 1),
+            ),
+        )
+        self.assertEqual(columns[2].path, ("price", "total"))
+        self.assertEqual(columns[2].labels[0].address, "B1")
+
+        self.assertEqual(columns[3].path, ("quantity", None))
+        self.assertEqual(columns[3].labels[0].level_span, 2)
+
+    def test_same_path_columns_stay_independent(self):
+        # 2x2 block merge: both columns share the same path
+        merges = [
+            {
+                "startRowIndex": 0,
+                "endRowIndex": 2,
+                "startColumnIndex": 0,
+                "endColumnIndex": 2,
+            }
+        ]
+        values = [["merged", ""], ["", ""], ["a", "b"]]
+        columns = utils.merged_header_columns(values, merges, 0, 0, 2)
+
+        self.assertEqual(len(columns), 2)
+        self.assertEqual(columns[0].path, ("merged", None))
+        self.assertEqual(columns[1].path, ("merged", None))
+        self.assertEqual(columns[0].column, "A")
+        self.assertEqual(columns[1].column, "B")
+
+    def test_out_of_range_merge_anchors(self):
+        # merge A1:B2, window B2:E5 with 1 header row: anchor A1 is outside
+        merges = [
+            {
+                "startRowIndex": 0,
+                "endRowIndex": 2,
+                "startColumnIndex": 0,
+                "endColumnIndex": 2,
+            }
+        ]
+        anchors = utils.out_of_range_merge_anchors(merges, 1, 1, 4, 4, 1)
+        self.assertEqual(anchors, [(0, 0)])
+
+        # no merge reaches outside the window: nothing to fetch
+        self.assertEqual(
+            utils.out_of_range_merge_anchors(self.MERGES, 0, 0, 3, 4, 2), []
+        )
+
+    def test_anchor_outside_window_uses_anchor_values(self):
+        # merge A1:B3, window B2:C4 with 2 header rows
+        merges = [
+            {
+                "startRowIndex": 0,
+                "endRowIndex": 3,
+                "startColumnIndex": 0,
+                "endColumnIndex": 2,
+            }
+        ]
+        values = [
+            ["", "x"],
+            ["", "y"],
+            ["d1", "d2"],
+        ]
+        columns = utils.merged_header_columns(
+            values, merges, 1, 1, 2, anchor_values={(0, 0): "region"}
+        )
+
+        # column B takes its label from the true top-left cell A1,
+        # recorded once for the two header levels it covers
+        self.assertEqual(columns[0].column, "B")
+        self.assertEqual(columns[0].path, ("region", None))
+        self.assertEqual(
+            columns[0].labels, (utils.HeaderLabel("region", "A1", 1, 1, 1, 2),)
+        )
+        self.assertEqual(columns[1].path, ("x", "y"))
+
+    def test_missing_anchor_value_raises(self):
+        merges = [
+            {
+                "startRowIndex": 0,
+                "endRowIndex": 2,
+                "startColumnIndex": 0,
+                "endColumnIndex": 2,
+            }
+        ]
+        with self.assertRaises(gspread.exceptions.InvalidInputValue):
+            utils.merged_header_columns([[""], ["d"]], merges, 1, 1, 1)
+
+    def test_merge_crossing_header_boundary_raises(self):
+        # merge A2:A3 crosses the boundary between 2 header rows and data
+        merges = [
+            {
+                "startRowIndex": 1,
+                "endRowIndex": 3,
+                "startColumnIndex": 0,
+                "endColumnIndex": 1,
+            }
+        ]
+        values = [["h"], ["h"], ["d"]]
+        with self.assertRaises(gspread.exceptions.MergedHeaderError):
+            utils.merged_header_columns(values, merges, 0, 0, 2)
+        with self.assertRaises(gspread.exceptions.MergedHeaderError):
+            utils.out_of_range_merge_anchors(merges, 0, 0, 3, 1, 2)
+
+    def test_merge_in_data_zone_is_ignored(self):
+        # merge A3:A4 is fully inside the data zone: no error, no header impact
+        merges = [
+            {
+                "startRowIndex": 2,
+                "endRowIndex": 4,
+                "startColumnIndex": 0,
+                "endColumnIndex": 1,
+            }
+        ]
+        values = [["h1"], ["d1"], ["d2"], ["d3"]]
+        columns = utils.merged_header_columns(values, merges, 0, 0, 1)
+        self.assertEqual(columns[0].path, ("h1",))
+
+    def test_merge_outside_window_columns_is_ignored(self):
+        # merge Z1:Z2 does not intersect the window columns
+        merges = [
+            {
+                "startRowIndex": 0,
+                "endRowIndex": 2,
+                "startColumnIndex": 25,
+                "endColumnIndex": 26,
+            }
+        ]
+        values = [["h1", "h2"], ["d1", "d2"]]
+        columns = utils.merged_header_columns(values, merges, 0, 0, 1)
+        self.assertEqual([c.path for c in columns], [("h1",), ("h2",)])
+
+    def test_invalid_header_rows(self):
+        with self.assertRaises(gspread.exceptions.InvalidInputValue):
+            utils.merged_header_columns(self.VALUES, [], 0, 0, 0)
+        with self.assertRaises(gspread.exceptions.InvalidInputValue):
+            utils.merged_header_columns(self.VALUES, [], 0, 0, 4)
+
+    def test_window_offset(self):
+        # window C5:E7 with 1 header row, no merges
+        values = [
+            ["h1", "h2", "h3"],
+            ["d1", "d2", "d3"],
+            ["d4", "d5", "d6"],
+        ]
+        columns = utils.merged_header_columns(values, [], 4, 2, 1)
+        self.assertEqual([c.column for c in columns], ["C", "D", "E"])
+        self.assertEqual([c.column_index for c in columns], [3, 4, 5])
+        self.assertEqual(
+            columns[0].labels, (utils.HeaderLabel("h1", "C5", 5, 3, 1, 1),)
+        )
